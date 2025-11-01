@@ -27,6 +27,47 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      
+  postgres:
+    image: postgres:16
+    container_name: l0-postgres
+    environment:
+      POSTGRES_DB: l0_wb
+      POSTGRES_USER: l0
+      POSTGRES_PASSWORD: L0
+    ports:
+      - "5433:5432"     # чтобы не конфликтовать с локальным PG
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U l0 -d l0_wb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    container_name: l0-app
+    depends_on:
+      kafka-broker-sandbox:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      # === HTTP ===
+      HTTP_ADDR: ":8081"
+      # === Kafka (в контейнере идём на внутренний адрес брокера) ===
+      KAFKA_BROKERS: "kafka-broker-sandbox:29092"
+      KAFKA_TOPIC: "orders"
+      KAFKA_GROUP_ID: "orders-consumer"
+      # === Postgres (в контейнере идём на сервис postgres) ===
+      POSTGRES_DSN: "postgres://l0:L0@postgres:5432/l0_wb?sslmode=disable"
+      # === Пулы/очереди/таймауты ===
+      WORKERS: "4"
+      QUEUE_SIZE: "100"
+      REQUEST_TIMEOUT: "5s"
+      # === Прогрев кеша из БД на старте ===
+      CACHE_WARMUP_LIMIT: "1000"
+    ports:
+      - "8081:8081"
 networks:
   default:
     name: kafka-net-sandbox
