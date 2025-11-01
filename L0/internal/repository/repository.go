@@ -1,85 +1,55 @@
 package repository
 
 import (
-	"L0/internal/model"
+	"L0/duration"
+	"L0/model"
 	"context"
-	"errors"
 	"fmt"
 	"log"
-	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var ErrNotFound = errors.New("order not found")
-
-// Интерфейсы — пригодятся для тестов/моков и хэндлеров.
-type OrderReader interface {
-	GetOrderByID(ctx context.Context, id string) (model.Order, bool, error)
-}
-
-type OrderWriter interface {
-	// Опционально, если будешь писать в БД через репозиторий
-	SaveOrder(ctx context.Context, o model.Order) error
-}
-
-// Базовая реализация.
 type Repository struct {
 	Conn *pgxpool.Pool
-
-	mu   sync.RWMutex
-	Cash map[string]model.Order // map[order_uid]Order
+	Cash map[string]model.Order
 }
 
-func New(conn *pgxpool.Pool) Repository {
-	return Repository{
-		Conn: conn,
-		Cash: make(map[string]model.Order),
-	}
-}
+func (repo *Repository) GetOrderById(id string) (*model.Order, error) {
 
-func (r *Repository) GetOrderById(ctx context.Context, id string) (model.Order, bool, error) {
-	r.mu.RLock()
-	if o, ok := r.Cash[id]; ok {
-		r.mu.RUnlock()
+	defer duration.Duration(duration.Track("foo"))
+	if o, ok := repo.Cash[id]; ok {
 		log.Printf("Кэше есть заказ с id = %s\n", id)
-		return o, true, nil
+		return &o, nil
 	}
-	r.mu.RUnlock()
-
 	log.Printf("Кэше нет заказа с id = %s, иду в бд\n", id)
 
-	o, err := r.TakeOrderFromDB(ctx, id)
+	o, err := repo.TakeOrderFromDB(id)
 	if err != nil {
-		return model.Order{}, false, err
-	}
-	if o == nil {
-		return model.Order{}, false, ErrNotFound
+		log.Printf("в БД нет заказа с id = %s\n", id)
+		return o, err
 	}
 
 	log.Printf("в БД есть заказ с id = %s положил его в кэш\n", id)
+	repo.Cash[id] = *o
+	return o, nil
 
-	r.mu.Lock()
-	r.Cash[id] = *o
-	r.mu.Unlock()
-
-	return *o, true, nil
 }
-func (repo *Repository) TakeOrderFromDB(ctx context.Context, id string) (*model.Order, error) {
+func (repo *Repository) TakeOrderFromDB(id string) (*model.Order, error) {
 	var o model.Order
-
-	tx, err := repo.Conn.BeginTx(ctx, pgx.TxOptions{
+	// 1) начинаем read-only транзакцию с консистентным снимком
+	tx, err := repo.Conn.BeginTx(context.Background(), pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
 		AccessMode: pgx.ReadOnly,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.Background()) // безопасно: если Commit прошёл — Rollback вернёт nil
 
-	//orders
-	if err := tx.QueryRow(ctx, `
+	// 2) orders
+	if err := tx.QueryRow(context.Background(), `
 		SELECT order_uid, track_number, entry, locale, internal_signature,
 		       customer_id, delivery_service, shardkey, sm_id,
 		       date_created, oof_shard
@@ -96,8 +66,8 @@ func (repo *Repository) TakeOrderFromDB(ctx context.Context, id string) (*model.
 		return nil, fmt.Errorf("select orders: %w", err)
 	}
 
-	// delivery
-	if err := tx.QueryRow(ctx, `
+	// 3) delivery (может не существовать — на твой выбор: делать LEFT или ErrNoRows обрабатывать)
+	if err := tx.QueryRow(context.Background(), `
 		SELECT order_id, name, phone, zip, city, address, region, email
 		FROM deliveries
 		WHERE order_id = $1
@@ -109,10 +79,11 @@ func (repo *Repository) TakeOrderFromDB(ctx context.Context, id string) (*model.
 		if err != pgx.ErrNoRows {
 			return nil, fmt.Errorf("select deliveries: %w", err)
 		}
+		// если нет доставки — оставим нулевые значения структуры
 	}
 
-	//  payment
-	if err := tx.QueryRow(ctx, `
+	// 4) payment (payment_dt как *time.Time)
+	if err := tx.QueryRow(context.Background(), `
 		SELECT order_id, transaction, request_id, currency, provider, amount, payment_dt,
 		       bank, delivery_cost, goods_total, custom_fee
 		FROM payments
@@ -128,8 +99,8 @@ func (repo *Repository) TakeOrderFromDB(ctx context.Context, id string) (*model.
 		}
 	}
 
-	// items (мб не 1)
-	rows, err := tx.Query(ctx, `
+	// 5) items (массив)
+	rows, err := tx.Query(context.Background(), `
 		SELECT order_id, chrt_id, track_number, price, rid, name, sale, size,
 		       total_price, nm_id, brand, status
 		FROM order_items
@@ -155,8 +126,8 @@ func (repo *Repository) TakeOrderFromDB(ctx context.Context, id string) (*model.
 		return nil, fmt.Errorf("rows order_items: %w", err)
 	}
 
-	// сommit
-	if err := tx.Commit(ctx); err != nil {
+	// 6) commit
+	if err := tx.Commit(context.Background()); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
 	return &o, nil

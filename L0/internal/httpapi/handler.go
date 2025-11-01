@@ -1,8 +1,9 @@
-package httpapi
+package client
 
 import (
-	"L0/internal/repository"
-	"L0/internal/util"
+	"L0/duration"
+	"L0/model"
+	"L0/repository"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -131,38 +132,28 @@ var orderTmpl = template.Must(template.New("order").Funcs(template.FuncMap{
 </html>
 `))
 
-func (h *Handler) order(w http.ResponseWriter, r *http.Request) {
-	defer util.Duration(util.Track("order"))
+func (h Handler) order(w http.ResponseWriter, r *http.Request) {
+	defer duration.Duration(duration.Track("foo"))
 	orderId := r.URL.Query().Get("id")
-	if orderId == "" {
-		http.Error(w, "нет введённого id", http.StatusBadRequest)
-		return
-	}
+
 	log.Printf("Начинаю показывать заказ с id = %s\n", orderId)
-
-	order, ok, err := h.repo.GetOrderById(r.Context(), orderId)
+	orderFromCash, err := h.repo.GetOrderById(orderId)
 	if err != nil {
-		log.Printf("внутренняя ошибка при поиске заказа %s: %v", orderId, err)
-		http.Error(w, "внутренняя ошибка", http.StatusInternalServerError)
+		log.Printf("не нашлось или не получилось взять заказ с id = %s, error %v", orderId, err)
 		return
 	}
-	if !ok {
-		http.Error(w, "заказ не найден", http.StatusNotFound)
-		return
-	}
-
-	j, err := json.Marshal(order)
+	j, err := json.Marshal(&orderFromCash)
 	if err != nil {
 		log.Printf("bad order struct with id = %s error: %v", orderId, err)
 	}
 	w.Write(j)
 }
 
-func (h *Handler) form(w http.ResponseWriter, r *http.Request) {
+func (h Handler) form(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		http.ServeFile(w, r, "internal/httpapi/form.html")
+		http.ServeFile(w, r, "client/form.html")
 
 	case http.MethodPost:
 		if err := r.ParseForm(); err != nil {
@@ -175,13 +166,8 @@ func (h *Handler) form(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		o, ok, err := h.repo.GetOrderById(r.Context(), id)
+		o, err := h.repo.GetOrderById(id)
 		if err != nil {
-			log.Printf("внутренняя ошибка при поиске заказа %s: %v", id, err)
-			http.Error(w, "внутренняя ошибка", http.StatusInternalServerError)
-			return
-		}
-		if !ok {
 			http.Error(w, "заказ не найден", http.StatusNotFound)
 			return
 		}
@@ -196,18 +182,18 @@ func (h *Handler) form(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "метод не поддерживается", http.StatusMethodNotAllowed)
 	}
 }
-
-func Run(pool *pgxpool.Pool, addr string) {
+func Run(conn *pgxpool.Pool) {
 	some := Handler{
-		repo: repository.New(pool),
+		repo: repository.Repository{
+			Conn: conn,
+			Cash: make(map[string]model.Order),
+		},
 	}
 
 	http.HandleFunc("/order", some.order)
 	http.HandleFunc("/form", some.form)
 
-	log.Printf("начинаю слушать localhost:%s", addr)
+	log.Printf("начинаю слушать localhost:8081")
+	http.ListenAndServe(":8081", nil)
 
-	if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
-		log.Printf("http server error: %v", err)
-	}
 }

@@ -1,12 +1,10 @@
 package main
 
 import (
-	"L0/internal/config"
-	"L0/internal/httpapi"
-	"L0/internal/model"
+	"L0/client"
+	"L0/model"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -20,49 +18,51 @@ import (
 	kafka "github.com/segmentio/kafka-go"
 )
 
+const (
+	topic         = "my-learning-topic"
+	brokerAddress = "localhost:9093"
+	groupID       = "my-learning-go-group"
+
+	host      = "127.0.0.1"
+	port      = 5432
+	user      = "l0"
+	password  = "L0"
+	dbname    = "l0_wb"
+	workers   = 4
+	queueSize = 4
+)
+
 type task struct {
 	value []byte
 	key   []byte
-
-	msg kafka.Message // исходное Kafka-сообщение для коммита
 }
 
 func main() {
-
-	cfg := config.MustLoad()
 	// канал для завершения канала чтения из кафки
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM) // для сигнала от системы о звершении
 
 	///////////////////////настройка консьюмера
 	r := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: cfg.KafkaBrokers,
-		Topic:   cfg.KafkaTopic,
-		GroupID: cfg.KafkaGroupID,
-
-		CommitInterval: 0, // 0 = коммитим вручную через CommitMessages
-
-		// Таймауты сессии и ребалансов
-		HeartbeatInterval: 3 * time.Second,
-		SessionTimeout:    30 * time.Second,
-		RebalanceTimeout:  30 * time.Second,
+		Brokers: []string{brokerAddress},
+		Topic:   topic,
+		GroupID: groupID,
 	})
-
 	defer r.Close()
-	log.Printf("Консьюмер подписан на топик '%s' в группе '%s'\n\n", cfg.KafkaTopic, cfg.KafkaGroupID)
+	log.Printf("Консьюмер подписан на топик '%s' в группе '%s'\n\n", topic, groupID)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	////////////////настройка бд
-	configPg, err := pgxpool.ParseConfig(cfg.PostgresDSN)
+	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+		host, port, user, password, dbname)
+	config, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
 		log.Fatal("Ошибка конфигурации пула: ", err)
 	}
-
-	configPg.MaxConns = 10 // Устанавливаем максимальное число соединений в пуле
-	configPg.MinConns = 2
-	configPg.MaxConnIdleTime = 5 * time.Minute
-
-	pool, err := pgxpool.NewWithConfig(ctx, configPg)
+	config.MaxConns = 10 // Устанавливаем максимальное число соединений в пуле
+	config.MinConns = 2
+	config.MaxConnIdleTime = 5 * time.Minute
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		log.Fatal("Ошибка создания пула: ", err)
 	}
@@ -70,103 +70,70 @@ func main() {
 	log.Println("Пул соединений успешно настроен")
 
 	//////////////////параллельно пишем в бд
-	tasks := make(chan task, cfg.QueueSize)
-	acks := make(chan kafka.Message, cfg.QueueSize)
+	tasks := make(chan task, queueSize)
 	var wg sync.WaitGroup
-
-	wg.Add(cfg.Workers)
-	for i := range cfg.Workers {
+	wg.Add(workers)
+	for i := range workers {
 		go func(id int) {
 			defer wg.Done()
 			for t := range tasks {
 				log.Printf("горутина %d приступает к парсингу сообщения с id = %s:\n", id, t.key)
-				ctxDb, cancelDb := context.WithTimeout(ctx, cfg.RequestTimeout)
-				err := parsJsonToDB(ctxDb, pool, t.value)
-				cancelDb()
+
+				err := parsJsonToBd(ctx, pool, t.value)
 				if err != nil {
 					log.Printf("ошибка записи cooбщения id = %s в бд: %v\n", t.key, err)
-					continue
 				}
-				acks <- t.msg
 			}
 		}(i + 1)
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case m, ok := <-acks:
-				if !ok {
-					return
-				}
-				if err := r.CommitMessages(ctx, m); err != nil {
-					log.Printf("ошибка CommitMessages: %v", err)
-				}
-			}
-		}
-	}()
 	/////////////читаем из кафки и кладем в канал
 	wg.Add(1)
 	go readMsgs(ctx, r, tasks, &wg)
-
 	wg.Add(1)
-	go httpapi.Run(pool, cfg.HTTPAddr)
+
+	go client.Run(pool)
 	wg.Done()
-
 	<-signalChan // пришел сигнал о завершении
-
 	fmt.Println("закрываю канал")
-
-	close(tasks) // воркеры
-	close(acks)  // коммиттер
-
-	fmt.Println("отменяю контекст") // reader/fetch
+	close(tasks)
+	fmt.Println("отменяю контекст")
 	cancel()
-
 	fmt.Println("закрываю горутины")
 	wg.Wait()
-
 	fmt.Println("стопаю сигн")
 	signal.Stop(signalChan)
 
 }
 
 func readMsgs(ctx context.Context, r *kafka.Reader, out chan<- task, wg *sync.WaitGroup) {
-	defer wg.Done()
-
 	for {
 		select {
 		case <-ctx.Done():
+			wg.Done()
 			return
 		default:
 		}
 
-		m, err := r.FetchMessage(ctx)
+		m, err := r.ReadMessage(ctx)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return
-			}
-			log.Printf("ошибка FetchMessage из Kafka: %v", err)
+			log.Printf("ошибка чтения из Kafka: %v\n", err)
 			continue
 		}
+		log.Printf("Сообщение key = %s прочитано из Kafka:\n", m.Key)
 
 		if !json.Valid(m.Value) {
 			log.Printf("пропуск невалидного JSON: partition=%d offset=%d", m.Partition, m.Offset)
-			if err := r.CommitMessages(ctx, m); err != nil {
-				log.Printf("ошибка CommitMessages (bad json): %v", err)
-			}
 			continue
 		}
 
-		out <- task{value: m.Value, key: m.Key, msg: m}
+		out <- task{value: m.Value, key: m.Key}
+
 	}
+
 }
 
-func parsJsonToDB(ctx context.Context, pool *pgxpool.Pool, data []byte) error {
+func parsJsonToBd(ctx context.Context, pool *pgxpool.Pool, data []byte) error {
 	var o model.Order
 
 	// парсинг JSON
@@ -175,10 +142,6 @@ func parsJsonToDB(ctx context.Context, pool *pgxpool.Pool, data []byte) error {
 	}
 	log.Printf("JSON id = %s успешно распаршен\n", o.OrderUID)
 
-	if err := o.Validate(); err != nil {
-		log.Printf("невалидный заказ (%s): %v", o.OrderUID, err)
-		return fmt.Errorf("validate JSON failed: %w", err)
-	}
 	// дочерним таблицам проставляем id
 	o.Delivery.OrderID = o.OrderUID
 	o.Payment.OrderID = o.OrderUID
@@ -190,6 +153,7 @@ func parsJsonToDB(ctx context.Context, pool *pgxpool.Pool, data []byte) error {
 	//начало транзакции
 	tx, err := pool.Begin(ctx)
 	if err != nil {
+
 		return err
 	}
 	defer tx.Rollback(ctx)
