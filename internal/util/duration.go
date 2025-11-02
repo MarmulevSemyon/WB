@@ -1,4 +1,4 @@
-package duration
+package util
 
 import (
 	"log"
